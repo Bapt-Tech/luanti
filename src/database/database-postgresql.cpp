@@ -280,7 +280,6 @@ bool MapDatabasePostgreSQL::deleteBlock(const v3s16 &pos)
 
 	execPrepared("delete_block", ARRLEN(args), args, argLen, argFmt);
 
-+
 	return true;
 }
 
@@ -315,7 +314,7 @@ void PlayerDatabasePostgreSQL::createDatabase()
     createTableIfNotExists("player",
         "CREATE TABLE player ("
             "name VARCHAR(60) NOT NULL,"
-            "hp INT NOT NULL,"
+            "hp INT NOT NULL," 
             "breath INT NOT NULL,"
             "creation_date TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),"
             "modification_date TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),"
@@ -323,20 +322,7 @@ void PlayerDatabasePostgreSQL::createDatabase()
             ");"
     );
 
-    // Nouvelle table pour la position et l'orientation
-    createTableIfNotExists("player_position",
-        "CREATE TABLE player_position ("
-            "name VARCHAR(60) NOT NULL PRIMARY KEY,"
-            "pitch NUMERIC(15, 7) NOT NULL,"
-            "yaw NUMERIC(15, 7) NOT NULL,"
-            "posX NUMERIC(15, 7) NOT NULL,"
-            "posY NUMERIC(15, 7) NOT NULL,"
-            "posZ NUMERIC(15, 7) NOT NULL,"
-            "CONSTRAINT fk_player FOREIGN KEY (name) REFERENCES player (name) ON DELETE CASCADE"
-            ");"
-    );
-
-	infostream << "PostgreSQL: Player Database was inited." << std::endl;
+    infostream << "PostgreSQL: Player Database was inited." << std::endl;
 }
 
 void PlayerDatabasePostgreSQL::initStatements()
@@ -426,6 +412,7 @@ void PlayerDatabasePostgreSQL::savePlayer(RemotePlayer *player)
 
     verifyDatabase();
 
+    // Sauvegarde dans PostgreSQL
     std::string hp = itos(sao->getHP());
     std::string breath = itos(sao->getBreath());
     const char *values[] = {
@@ -434,156 +421,53 @@ void PlayerDatabasePostgreSQL::savePlayer(RemotePlayer *player)
         breath.c_str()
     };
 
-    const char* rmvalues[] = { player->getName().c_str() };
     beginSave();
-
-    // Sauvegarde player (sans position)
     execPrepared("save_player", 3, values, true, false);
+    endSave();
 
-    // Sauvegarde position
-    v3f pos = sao->getBasePosition();
-    std::string pitch = ftos(sao->getLookPitch());
-    std::string yaw = ftos(sao->getRotation().Y);
-    std::string posx = ftos(pos.X);
-    std::string posy = ftos(pos.Y);
-    std::string posz = ftos(pos.Z);
-    const char *pos_values[] = {
-        player->getName().c_str(),
-        pitch.c_str(),
-        yaw.c_str(),
-        posx.c_str(), posy.c_str(), posz.c_str()
-    };
-    execPrepared("save_player_position", 6, pos_values, true, false);
+    // Sauvegarde des positions dans SQLite
+    PlayerPositionDatabaseSQLite *sqlite_db = player->getPositionDB();
+    if(sqlite_db) {
+        v3f pos = sao->getPosition();
+        sqlite_db->savePlayerPosition(player->getName(),
+            sao->getPitch(),
+            sao->getYaw(),
+            pos.X, pos.Y, pos.Z);
+    }
 
-	// Write player inventories
-	execPrepared("remove_player_inventories", 1, rmvalues);
-	execPrepared("remove_player_inventory_items", 1, rmvalues);
-
-	const auto &inventory_lists = sao->getInventory()->getLists();
-	std::ostringstream oss;
-	for (u16 i = 0; i < inventory_lists.size(); i++) {
-		const InventoryList* list = inventory_lists[i];
-		const std::string &name = list->getName();
-		std::string width = itos(list->getWidth()),
-			inv_id = itos(i), lsize = itos(list->getSize());
-
-		const char* inv_values[] = {
-			player->getName().c_str(),
-			inv_id.c_str(),
-			width.c_str(),
-			name.c_str(),
-			lsize.c_str()
-		};
-		execPrepared("add_player_inventory", 5, inv_values);
-
-		for (u32 j = 0; j < list->getSize(); j++) {
-			oss.str("");
-			oss.clear();
-			list->getItem(j).serialize(oss);
-			std::string itemStr = oss.str(), slotId = itos(j);
-
-			const char* invitem_values[] = {
-				player->getName().c_str(),
-				inv_id.c_str(),
-				slotId.c_str(),
-				itemStr.c_str()
-			};
-			execPrepared("add_player_inventory_item", 4, invitem_values);
-		}
-	}
-
-	execPrepared("remove_player_metadata", 1, rmvalues);
-	const StringMap &attrs = sao->getMeta().getStrings();
-	for (const auto &attr : attrs) {
-		const char *meta_values[] = {
-			player->getName().c_str(),
-			attr.first.c_str(),
-			attr.second.c_str()
-		};
-		execPrepared("save_player_metadata", 3, meta_values);
-	}
-	endSave();
-
-	player->onSuccessfulSave();
+    player->onSuccessfulSave();
 }
 
 bool PlayerDatabasePostgreSQL::loadPlayer(RemotePlayer *player, PlayerSAO *sao)
 {
-	sanity_check(sao);
-	verifyDatabase();
+    sanity_check(sao);
+    verifyDatabase();
 
-	const char *values[] = { player->getName().c_str() };
-
-    // Charger la position
-    PGresult *results = execPrepared("load_player_position", 1, values, false, false);
+    // Chargement depuis PostgreSQL
+    const char *values[] = { player->getName().c_str() };
+    PGresult *results = execPrepared("load_player", 1, values, false, false);
+    
     if (!PQntuples(results)) {
         PQclear(results);
         return false;
     }
-    sao->setLookPitch(pg_to_float(results, 0, 0));
-    sao->setRotation(v3f(0, pg_to_float(results, 0, 1), 0));
-    sao->setBasePosition(v3f(
-        pg_to_float(results, 0, 2),
-        pg_to_float(results, 0, 3),
-        pg_to_float(results, 0, 4))
-    );
+
+    sao->setHPRaw((u16) pg_to_int(results, 0, 0));
+    sao->setBreath((u16) pg_to_int(results, 0, 1), false);
     PQclear(results);
 
-    // Charger le reste (hp, breath, etc.)
-    PGresult *results2 = execPrepared("load_player", 1, values, false, false);
-    if (!PQntuples(results2)) {
-        PQclear(results2);
-        return false;
+    // Chargement des positions depuis SQLite
+    PlayerPositionDatabaseSQLite *sqlite_db = player->getPositionDB();
+    if(sqlite_db) {
+        float pitch, yaw, posX, posY, posZ;
+        if(sqlite_db->loadPlayerPosition(player->getName(), pitch, yaw, posX, posY, posZ)) {
+            sao->setPitch(pitch);
+            sao->setYaw(yaw);
+            sao->setPosition(v3f(posX, posY, posZ));
+        }
     }
-    sao->setHPRaw((u16) pg_to_int(results2, 0, 0));
-    sao->setBreath((u16) pg_to_int(results2, 0, 1), false);
-    PQclear(results2);
 
-	// Load inventory
-	results = execPrepared("load_player_inventories", 1, values, false, false);
-
-	int resultCount = PQntuples(results);
-
-	for (int row = 0; row < resultCount; ++row) {
-		InventoryList* invList = player->inventory.
-			addList(PQgetvalue(results, row, 2), pg_to_uint(results, row, 3));
-		invList->setWidth(pg_to_uint(results, row, 1));
-
-		u32 invId = pg_to_uint(results, row, 0);
-		std::string invIdStr = itos(invId);
-
-		const char* values2[] = {
-			player->getName().c_str(),
-			invIdStr.c_str()
-		};
-		PGresult *results2 = execPrepared("load_player_inventory_items", 2,
-			values2, false, false);
-
-		int resultCount2 = PQntuples(results2);
-		for (int row2 = 0; row2 < resultCount2; row2++) {
-			const std::string itemStr = PQgetvalue(results2, row2, 1);
-			if (itemStr.length() > 0) {
-				ItemStack stack;
-				stack.deSerialize(itemStr);
-				invList->changeItem(pg_to_uint(results2, row2, 0), stack);
-			}
-		}
-		PQclear(results2);
-	}
-
-	PQclear(results);
-
-	results = execPrepared("load_player_metadata", 1, values, false);
-
-	int numrows = PQntuples(results);
-	for (int row = 0; row < numrows; row++) {
-		sao->getMeta().setString(PQgetvalue(results, row, 0), PQgetvalue(results, row, 1));
-	}
-	sao->getMeta().setModified(false);
-
-	PQclear(results);
-
-	return true;
+    return true;
 }
 
 bool PlayerDatabasePostgreSQL::removePlayer(const std::string &name)
